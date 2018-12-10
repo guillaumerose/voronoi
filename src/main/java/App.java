@@ -9,11 +9,13 @@ import org.opengis.feature.simple.SimpleFeature;
 import org.opengis.feature.simple.SimpleFeatureType;
 import org.opengis.filter.Filter;
 
-import java.io.BufferedWriter;
-import java.io.File;
-import java.io.FileWriter;
+import java.io.*;
 import java.net.MalformedURLException;
 import java.util.*;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.LinkedBlockingQueue;
+import java.util.concurrent.ThreadPoolExecutor;
+import java.util.concurrent.TimeUnit;
 import java.util.stream.Collectors;
 import java.util.stream.Stream;
 
@@ -37,8 +39,8 @@ public class App {
         STRtree tree = new STRtree();
         Set<Coordinate> seen = new HashSet<>();
 
-        int j = 0;
 
+        int counter = 0;
         DataStore dataStore = DataStoreFinder.getDataStore(dataStoreDetails());
         FeatureSource<SimpleFeatureType, SimpleFeature> source = dataStore.getFeatureSource(dataStore.getTypeNames()[0]);
         try (FeatureIterator<SimpleFeature> features = source.getFeatures(Filter.INCLUDE).features()) {
@@ -50,19 +52,31 @@ public class App {
                     seen.add(new Coordinate(value.getX(), value.getY()));
                     tree.insert(point.getEnvelopeInternal(), new Local(point, (long) feature.getAttribute("ID")));
                 }
-                if (j % 100000 == 0) {
-                    System.out.println(j);
+                if (counter % 100000 == 0) {
+                    System.out.println(counter);
                 }
-                j++;
+                counter++;
             }
         }
         dataStore.dispose();
 
 
-        j = 0;
+        int corePoolSize = 5;
+        int maxPoolSize = 10;
+        long keepAliveTime = 5000;
+
+        ThreadPoolExecutor executors =
+                new ThreadPoolExecutor(
+                        corePoolSize,
+                        maxPoolSize,
+                        keepAliveTime,
+                        TimeUnit.MILLISECONDS,
+                        new LinkedBlockingQueue<>(1000));
+
 
         BufferedWriter writer = new BufferedWriter(new FileWriter("/tmp/output.csv"));
 
+        counter = 0;
         dataStore = DataStoreFinder.getDataStore(dataStoreDetails());
         source = dataStore.getFeatureSource(dataStore.getTypeNames()[0]);
         try (FeatureIterator<SimpleFeature> features = source.getFeatures(Filter.INCLUDE).features()) {
@@ -70,43 +84,51 @@ public class App {
                 SimpleFeature feature = features.next();
                 org.locationtech.jts.geom.Point value = (org.locationtech.jts.geom.Point) feature.getDefaultGeometryProperty().getValue();
                 Point point = gf.createPoint(new Coordinate(value.getX(), value.getY()));
-                List<Local> neighbors = find(tree, point.buffer(1500)).collect(Collectors.toList());
 
-                if (neighbors.size() == 1) {
-                    writer.write(feature.getAttribute("ID") + ";" + feature.getAttribute("BHD2020") + ";" + point.buffer(500) + "\n");
-                } else {
-                    Point[] points = new Point[neighbors.size()];
-                    for (int i = 0; i < neighbors.size(); i++) {
-                        points[i] = neighbors.get(i).point;
-                    }
-                    MultiPoint multiPoint = gf.createMultiPoint(points);
-                    VoronoiDiagramBuilder builder = new VoronoiDiagramBuilder();
-                    builder.setSites(multiPoint);
-                    Geometry voronoi = builder.getDiagram(gf);
+                while (executors.getQueue().remainingCapacity() == 0) {
+                    Thread.sleep(100);
+                }
+                executors.submit(() -> {
+                    try {
+                        List<Local> neighbors = find(tree, point.buffer(1100)).collect(Collectors.toList());
 
-                    for (int i = 0; i < voronoi.getNumGeometries(); i++) {
-                        Geometry polygon = voronoi.getGeometryN(i);
-                        if (polygon.contains(point)) {
-                            writer.write(feature.getAttribute("ID") + ";" + feature.getAttribute("BHD2020") + ";" + polygon.intersection(point.buffer(500)) + "\n");
+                        if (neighbors.size() == 1) {
+                            writer.write(feature.getAttribute("ID") + ";" + feature.getAttribute("BHD2020") + ";" + point.buffer(500) + "\n");
+                        } else {
+                            Point[] points = new Point[neighbors.size()];
+                            for (int i = 0; i < neighbors.size(); i++) {
+                                points[i] = neighbors.get(i).point;
+                            }
+                            MultiPoint multiPoint = gf.createMultiPoint(points);
+                            VoronoiDiagramBuilder builder = new VoronoiDiagramBuilder();
+                            builder.setSites(multiPoint);
+                            Geometry voronoi = builder.getDiagram(gf);
+
+                            for (int i = 0; i < voronoi.getNumGeometries(); i++) {
+                                Geometry polygon = voronoi.getGeometryN(i);
+                                if (polygon.contains(point)) {
+                                    writer.write(feature.getAttribute("ID") + ";" + feature.getAttribute("BHD2020") + ";" + polygon.intersection(point.buffer(500)) + "\n");
+                                }
+                            }
                         }
+                    } catch (IOException e) {
+                        System.out.println(e);
                     }
+                });
+                if (counter % 1000 == 0) {
+                    System.out.println(counter);
                 }
-                if (j % 1000 == 0) {
-                    System.out.println(j);
-                }
-                j++;
-                if (j == 100000) {
-                    break;
-                }
+                counter++;
             }
         }
+        executors.awaitTermination(1, TimeUnit.HOURS);
 
         writer.close();
         dataStore.dispose();
     }
 
     private static Map<String, Object> dataStoreDetails() throws MalformedURLException {
-        File file = new File("/Users/guillaumerose/Ariane/shp_simu2020_cohesion_super_france/simu_2020_cohesion_super_france.shp");
+        File file = new File("/tmp/input.shp");
         Map<String, Object> map = new HashMap<>();
         map.put("url", file.toURI().toURL());
         return map;
